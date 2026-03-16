@@ -181,7 +181,8 @@ async def test_process_direct_runs_phase1_governor_flow_end_to_end(tmp_path: Pat
     assert response == "assistant stores apples"
     assert "remember apples -> assistant stores apples" in history_text
     assert "assistant stores apples" in memory_text
-    assert loop.memory_consolidator.maybe_consolidate_by_tokens.await_count == 2
+    # First call is awaited before processing; second call is scheduled in background (upstream change)
+    assert loop.memory_consolidator.maybe_consolidate_by_tokens.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -244,7 +245,7 @@ async def test_process_direct_with_noop_governor_does_not_write_memory_files(
     assert response == "assistant stores apples"
     assert not (tmp_path / "memory" / "HISTORY.md").exists()
     assert not (tmp_path / "memory" / "MEMORY.md").exists()
-    assert loop.memory_consolidator.maybe_consolidate_by_tokens.await_count == 2
+    assert loop.memory_consolidator.maybe_consolidate_by_tokens.await_count == 1
 
 
 @pytest.mark.asyncio

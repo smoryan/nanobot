@@ -463,7 +463,16 @@ class MemoryConsolidator:
             snapshot = session.messages[session.last_consolidated :]
             if not snapshot:
                 return True
-            return await self.consolidate_messages(snapshot)
+        return await self.archive_messages(snapshot)
+
+    async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
+        """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
+        if not messages:
+            return True
+        for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
+            if await self.consolidate_messages(messages):
+                return True
+        return True
 
     async def maybe_consolidate_by_tokens(self, session: Session) -> None:
         """Loop: archive old messages until prompt fits within half the context window."""
