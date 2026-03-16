@@ -63,3 +63,13 @@ async def test_handle_event_decides_and_applies_actions(tmp_path) -> None:
 
     service.decide_actions.assert_awaited_once()
     service.apply_actions.assert_awaited_once_with([{"kind": "noop", "id": "noop-1"}])
+
+
+@pytest.mark.asyncio
+async def test_decide_actions_returns_empty_without_tool_calls(tmp_path) -> None:
+    provider = DummyProvider([LLMResponse(content="no tool", tool_calls=[])])
+    service = MemoryGovernorService(workspace=tmp_path, provider=provider, model="test-model")
+
+    actions = await service.decide_actions("prompt")
+
+    assert actions == []

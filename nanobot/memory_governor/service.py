@@ -58,5 +58,8 @@ class MemoryGovernorService:
                 turn_text,
             ]
         )
-        actions = await self.decide_actions(prompt)
-        await self.apply_actions(actions)
+        try:
+            actions = await self.decide_actions(prompt)
+            await self.apply_actions(actions)
+        except ValueError:
+            return

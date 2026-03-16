@@ -87,6 +87,74 @@ class EndToEndProvider(LLMProvider):
         return "test-model"
 
 
+class NoopGovernorProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        tool_names = {
+            tool.get("function", {}).get("name") for tool in (tools or []) if isinstance(tool, dict)
+        }
+        if "membeat" in tool_names:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="mb_noop",
+                        name="membeat",
+                        arguments={"actions": [{"kind": "noop", "id": "noop-1"}]},
+                    )
+                ],
+            )
+        return LLMResponse(content="assistant stores apples", tool_calls=[])
+
+    def get_default_model(self) -> str:
+        return "test-model"
+
+
+class MalformedGovernorProvider(LLMProvider):
+    def __init__(self) -> None:
+        super().__init__()
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        tool_names = {
+            tool.get("function", {}).get("name") for tool in (tools or []) if isinstance(tool, dict)
+        }
+        if "membeat" in tool_names:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="mb_bad",
+                        name="membeat",
+                        arguments={"actions": [{"kind": "broken", "id": "bad-1"}]},
+                    )
+                ],
+            )
+        return LLMResponse(content="assistant stores apples", tool_calls=[])
+
+    def get_default_model(self) -> str:
+        return "test-model"
+
+
 @pytest.mark.asyncio
 async def test_process_direct_runs_phase1_governor_flow_end_to_end(tmp_path: Path) -> None:
     provider = EndToEndProvider()
@@ -149,3 +217,51 @@ async def test_governor_prompt_includes_structured_event_evidence(tmp_path: Path
     assert "turn_messages:" in user_prompt
     assert "USER: remember apples" in user_prompt
     assert "ASSISTANT: assistant stores apples" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_process_direct_with_noop_governor_does_not_write_memory_files(
+    tmp_path: Path,
+) -> None:
+    provider = NoopGovernorProvider()
+    governor = MemoryGovernorService(workspace=tmp_path, provider=provider, model="test-model")
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        memory_governor=governor,
+        context_window_tokens=65_536,
+    )
+
+    original_maybe_consolidate = loop.memory_consolidator.maybe_consolidate_by_tokens
+    loop.memory_consolidator.maybe_consolidate_by_tokens = AsyncMock(
+        wraps=original_maybe_consolidate
+    )
+
+    response = await loop.process_direct("remember apples", session_key="cli:test")
+
+    assert response == "assistant stores apples"
+    assert not (tmp_path / "memory" / "HISTORY.md").exists()
+    assert not (tmp_path / "memory" / "MEMORY.md").exists()
+    assert loop.memory_consolidator.maybe_consolidate_by_tokens.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_process_direct_ignores_malformed_governor_output(tmp_path: Path) -> None:
+    provider = MalformedGovernorProvider()
+    governor = MemoryGovernorService(workspace=tmp_path, provider=provider, model="test-model")
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        memory_governor=governor,
+        context_window_tokens=65_536,
+    )
+
+    response = await loop.process_direct("remember apples", session_key="cli:test")
+
+    assert response == "assistant stores apples"
+    assert not (tmp_path / "memory" / "HISTORY.md").exists()
+    assert not (tmp_path / "memory" / "MEMORY.md").exists()
