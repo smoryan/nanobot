@@ -144,6 +144,7 @@ class MemoryEvent:
     channel: str
     chat_id: str
     message_count: int
+    messages: list[dict[str, Any]] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.now)
 
 

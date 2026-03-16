@@ -574,6 +574,7 @@ class AgentLoop:
             channel=channel,
             chat_id=chat_id,
             message_count=message_count,
+            messages=[dict(message) for message in session.messages[-message_count:]],
         )
         if self.memory_governor is not None:
             await self.memory_governor.handle_event(event)
