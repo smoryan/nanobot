@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import weakref
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -44,6 +45,47 @@ _SAVE_MEMORY_TOOL = [
     }
 ]
 
+_MEMBEAT_ACTION_KINDS = ["append_history", "upsert_memory", "emit_todo", "noop"]
+
+_MEMBEAT_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "membeat",
+            "description": "Report deterministic memory governance actions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": _MEMBEAT_ACTION_KINDS,
+                                },
+                                "id": {"type": "string"},
+                                "timestamp": {"type": "string"},
+                                "type": {"type": "string"},
+                                "tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "source": {"type": "string"},
+                                "importance": {"type": "string"},
+                                "body": {"type": "string"},
+                            },
+                            "required": ["kind", "id"],
+                        },
+                    }
+                },
+                "required": ["actions"],
+            },
+        },
+    }
+]
+
 
 def _ensure_text(value: Any) -> str:
     """Normalize tool-call payload values to text for file storage."""
@@ -58,6 +100,30 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
 
+
+def normalize_membeat_actions(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    if not isinstance(payload, dict):
+        raise ValueError("membeat payload must be an object")
+
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("membeat payload must contain an actions list")
+
+    normalized: list[dict[str, Any]] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            raise ValueError("membeat actions must be objects")
+        kind = action.get("kind")
+        if kind not in _MEMBEAT_ACTION_KINDS:
+            raise ValueError(f"unsupported membeat action kind: {kind}")
+        normalized.append(action)
+
+    return normalized
+
+
 _TOOL_CHOICE_ERROR_MARKERS = (
     "tool_choice",
     "toolchoice",
@@ -70,6 +136,35 @@ def _is_tool_choice_unsupported(content: str | None) -> bool:
     """Detect provider errors caused by forced tool_choice being unsupported."""
     text = (content or "").lower()
     return any(m in text for m in _TOOL_CHOICE_ERROR_MARKERS)
+
+
+@dataclass
+class MemoryEvent:
+    session_key: str
+    channel: str
+    chat_id: str
+    message_count: int
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+def _render_tagged_block(
+    timestamp: str,
+    block_type: str,
+    tags: list[str],
+    source: str,
+    importance: str,
+    body: str,
+) -> str:
+    lines = [
+        f"[{timestamp}]",
+        f"[%type: {block_type}]",
+        f"[%tags: {','.join(tags)}]",
+        f"[%source: {source}]",
+        f"[%importance: {importance}]",
+        "",
+        body.strip(),
+    ]
+    return "\n".join(lines).rstrip()
 
 
 class MemoryStore:
@@ -95,6 +190,74 @@ class MemoryStore:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
+    def append_history_block(
+        self,
+        timestamp: str,
+        block_type: str,
+        tags: list[str],
+        source: str,
+        importance: str,
+        body: str,
+    ) -> None:
+        self.append_history(
+            _render_tagged_block(
+                timestamp=timestamp,
+                block_type=block_type,
+                tags=tags,
+                source=source,
+                importance=importance,
+                body=body,
+            )
+        )
+
+    def apply_membeat_action(self, action: dict[str, Any]) -> None:
+        kind = action.get("kind")
+        if kind == "append_history":
+            self.append_history_block(
+                timestamp=str(action["timestamp"]),
+                block_type=str(action["type"]),
+                tags=[str(tag) for tag in action.get("tags", [])],
+                source=str(action["source"]),
+                importance=str(action["importance"]),
+                body=str(action["body"]),
+            )
+            return
+
+        if kind == "upsert_memory":
+            merge_key = str(action["merge_key"])
+            body = str(action["body"]).strip()
+            heading = f"## {merge_key}"
+            block = f"{heading}\n\n{body}".strip()
+            current = self.read_long_term().strip()
+
+            if not current:
+                self.write_long_term(block + "\n")
+                return
+
+            parts = current.split("\n## ")
+            normalized_parts = [parts[0]]
+            normalized_parts.extend(f"## {part}" for part in parts[1:])
+
+            updated_parts: list[str] = []
+            replaced = False
+            for part in normalized_parts:
+                if part.startswith(heading):
+                    updated_parts.append(block)
+                    replaced = True
+                else:
+                    updated_parts.append(part.strip())
+
+            if not replaced:
+                updated_parts.append(block)
+
+            self.write_long_term("\n\n".join(part for part in updated_parts if part).strip() + "\n")
+            return
+
+        if kind == "noop":
+            return
+
+        raise ValueError(f"unsupported membeat action kind: {kind}")
+
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
@@ -105,7 +268,9 @@ class MemoryStore:
         for message in messages:
             if not message.get("content"):
                 continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
+            )
             lines.append(
                 f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
             )
@@ -131,7 +296,10 @@ class MemoryStore:
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {
+                "role": "system",
+                "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+            },
             {"role": "user", "content": prompt},
         ]
 
@@ -144,9 +312,7 @@ class MemoryStore:
                 tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
+            if response.finish_reason == "error" and _is_tool_choice_unsupported(response.content):
                 logger.warning("Forced tool_choice unsupported, retrying with auto")
                 response = await provider.chat_with_retry(
                     messages=chat_messages,
@@ -178,7 +344,9 @@ class MemoryStore:
             update = args["memory_update"]
 
             if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
+                logger.warning(
+                    "Memory consolidation: save_memory payload contains null required fields"
+                )
                 return self._fail_or_raw_archive(messages)
 
             entry = _ensure_text(entry).strip()
@@ -211,12 +379,9 @@ class MemoryStore:
         """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
+            f"[{ts}] [RAW] {len(messages)} messages\n{self._format_messages(messages)}"
         )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
+        logger.warning("Memory consolidation degraded: raw-archived {} messages", len(messages))
 
 
 class MemoryConsolidator:
@@ -276,7 +441,7 @@ class MemoryConsolidator:
     def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
         """Estimate current prompt size for the normal session history view."""
         history = session.get_history(max_messages=0)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        channel, chat_id = session.key.split(":", 1) if ":" in session.key else (None, None)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -294,7 +459,7 @@ class MemoryConsolidator:
         """Archive the full unconsolidated tail for /new-style session rollover."""
         lock = self.get_lock(session.key)
         async with lock:
-            snapshot = session.messages[session.last_consolidated:]
+            snapshot = session.messages[session.last_consolidated :]
             if not snapshot:
                 return True
             return await self.consolidate_messages(snapshot)
@@ -334,7 +499,7 @@ class MemoryConsolidator:
                     return
 
                 end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
+                chunk = session.messages[session.last_consolidated : end_idx]
                 if not chunk:
                     return
 
